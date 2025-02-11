@@ -202,5 +202,5 @@ class Trainer:
 
 
 if __name__ == "__main__":
-    trainer = Trainer(100, "./data/results.toml")
+    trainer = Trainer(20, "./data/results.toml")
     trainer.run()
