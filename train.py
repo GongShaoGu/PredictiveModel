@@ -194,6 +194,7 @@ class Trainer:
                         data["accs"].append(acc)
                 self.toml_dict["hyper"].append(hyper)
                 self.toml_dict["data"].append(data)
+                self.save_data()
 
     def save_data(self):
         with open(self.output_path, "w", encoding="utf-8") as f:
@@ -203,4 +204,3 @@ class Trainer:
 if __name__ == "__main__":
     trainer = Trainer(100, "./data/results.toml")
     trainer.run()
-    trainer.save_data()
