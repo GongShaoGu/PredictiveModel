@@ -1,69 +1,75 @@
+import argparse
 import os
 import time
-from typing import Tuple
+import pandas as pd
+from typing import Tuple, List
 
-import matplotlib.pyplot as plt
-import tomlkit
 from numpy import random
 from tqdm import tqdm
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
 import torchvision
 import torchvision.models as models
 import torchvision.transforms as transforms
-
-from functools import partial
-
-
-def get_data_loader(
-    batch_size: int = 64,
-) -> Tuple[DataLoader, DataLoader]:
-    """
-    取得train_loader和test_loader
-
-    Args:
-        model_type: 模型的類別
-        batch_size: 一個批次的大小
-
-    Returns:
-        train_loader: 訓練用的dataloader
-        test_loader: 驗證用的dataloader
-    """
-    data_dir = "/home/ray_cluster/Documents/workspace/tune_population_based/data"
-    if not os.path.exists(data_dir):
-        os.makedirs(data_dir)
-    transform = transforms.Compose(
-        [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
-    )
-
-    my_get_loader = partial(DataLoader, batch_size=batch_size, shuffle=True)
-
-    train_dataset = torchvision.datasets.CIFAR100(
-        root=data_dir, train=True, download=True, transform=transform
-    )
-    test_dataset = torchvision.datasets.CIFAR100(
-        root=data_dir, train=False, download=True, transform=transform
-    )
-
-    train_loader, test_loader = (
-        my_get_loader(train_dataset),
-        my_get_loader(test_dataset),
-    )
-
-    return train_loader, test_loader
+import psutil
 
 
-def train_epoch(
+class MyDataLoader:
+    def __init__(self, data_dir: str) -> None:
+        os.makedirs(data_dir, exist_ok=True)
+        transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ]
+        )
+        self.train_dataset = torchvision.datasets.CIFAR10(
+            root=data_dir, train=True, download=True, transform=transform
+        )
+        self.test_dataset = torchvision.datasets.CIFAR10(
+            root=data_dir, train=True, download=True, transform=transform
+        )
+        cpu_count = psutil.cpu_count(logical=True)
+        self.num_workers = (
+            cpu_count // 2 if type(cpu_count) is int and cpu_count > 2 else 1
+        )
+
+    def get_data_loader(self, batch_size: int) -> Tuple[DataLoader, DataLoader]:
+        """
+        取得train_loader和test_loader
+
+        Args:
+            batch_size: 一個批次的大小
+
+        Returns:
+            train_loader: 訓練用的dataloader
+            test_loader: 驗證用的dataloader
+        """
+        train_loader = DataLoader(
+            dataset=self.train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+        )
+        test_loader = DataLoader(
+            dataset=self.test_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+        )
+        return train_loader, test_loader
+
+
+def train(
     model: nn.Module,
     optimizer: optim.Optimizer,
     train_loader: DataLoader,
     device: torch.device = torch.device("cpu"),
-) -> Tuple[float, float]:
+) -> List:
     """
     訓練輸入的模型一個epoch
 
@@ -74,11 +80,10 @@ def train_epoch(
         device: 訓練使用的裝置
 
     Returns:
-        avg_loss: epoch的平均loss
-        avg_time: 每個batch的平均訓練時間
+        times: 每個batch的訓練時間
     """
+    times = []
     model.to(device)
-    total_loss = 0.0
     total_time = 0.0
     model.train()
     criterion = nn.CrossEntropyLoss().to(device)
@@ -91,12 +96,9 @@ def train_epoch(
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item()
         total_time += time.time() - start_time
-
-    avg_loss = total_loss / len(train_loader)
-    avg_time = total_time / len(train_loader)
-    return avg_loss, avg_time
+        times.append(total_time)
+    return times
 
 
 def test(
@@ -132,56 +134,95 @@ def test(
 
 
 class Trainer:
-    def __init__(self, num_experiment: int, output_path: str) -> None:
+    def __init__(self, data_dir: str, num_experiment: int, output_path: str) -> None:
+        """
+        初始化Trainer
+
+        Args:
+            data_dir: 用以訓練的資料
+            num_experiment: 試驗的次數
+            output_path: 輸出資料的存放位置
+        """
+        self.data_dir = data_dir
         self.num_experiment = num_experiment
         self.output_path = output_path
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.toml_dict = tomlkit.table()
-        self.toml_dict["hyper"] = tomlkit.array()
-        self.toml_dict["data"] = tomlkit.array()
+        cpu_count = psutil.cpu_count(logical=True)
+        cpu_freq_max = psutil.cpu_freq().max
+        cpu_freq_min = psutil.cpu_freq().min
+        mem = psutil.virtual_memory()
+        total_mem = mem.total / (1024**3)
+        if torch.cuda.is_available():
+            gpu = torch.cuda.get_device_name(0)
+        else:
+            gpu = "None"
+        self.hardware = {
+            "cpu_count": cpu_count,
+            "cpu_freq_max": cpu_freq_max,
+            "cpu_freq_min": cpu_freq_min,
+            "mem": total_mem,
+            "gpu": gpu,
+        }
+
+    def _save_data(self, data) -> None:
+        os.makedirs(name=self.output_path, exist_ok=True)
+        csv_file = os.path.join(self.output_path, "results.csv")
+
+        df = pd.DataFrame(data)
+        if os.path.exists(csv_file):
+            df.to_csv(csv_file, mode="a", header=False, index=False)
+        else:
+            df.to_csv(csv_file, mode="w", header=True, index=False)
 
     def run(self) -> None:
-        train_loader, test_loader = get_data_loader(batch_size=512)
+        """
+        呼叫Trainer訓練，產生數據
+        """
+        my_data_loader = MyDataLoader(data_dir=self.data_dir)
         with tqdm(
             range(self.num_experiment), unit="experiment", ncols=100, leave=False
         ) as pbar:
             for _ in pbar:
                 hyper = {
-                    "lr": random.uniform(0.001, 1),
-                    "momentum": random.uniform(0.001, 1),
+                    "lr": random.uniform(0.0001, 1),
+                    "momentum": random.uniform(0.0001, 1),
                     "model_type": random.choice(
                         [
                             "resnet-18",
                             "resnet-34",
                             "resnet-50",
-                            "resnet-101",
-                            "resnet-152",
                         ]
+                    ),
+                    "batch_size": int(
+                        random.choice(
+                            [
+                                128,
+                                256,
+                                512,
+                                1024,
+                            ]
+                        )
                     ),
                 }
                 pbar.set_description("Training " + hyper["model_type"])
                 if hyper["model_type"] == "resnet-18":
-                    model = torchvision.models.resnet18()
+                    model = models.resnet18()
                 elif hyper["model_type"] == "resnet-34":
-                    model = torchvision.models.resnet34()
-                elif hyper["model_type"] == "resnet-50":
-                    model = torchvision.models.resnet50()
-                elif hyper["model_type"] == "resnet-101":
-                    model = torchvision.models.resnet101()
+                    model = models.resnet34()
                 else:
-                    model = torchvision.models.resnet152()
+                    model = models.resnet50()
                 optimizer = torch.optim.SGD(
                     params=model.parameters(),
                     lr=hyper["lr"],
                     momentum=hyper["momentum"],
                 )
-                data = {
-                    "times": [],
-                    "accs": [],
-                }
-                with tqdm(range(50), unit="epoch", ncols=80, leave=False) as epoch_bar:
+                train_loader, test_loader = my_data_loader.get_data_loader(
+                    hyper["batch_size"]
+                )
+                datas = []
+                with tqdm(range(20), unit="epoch", ncols=80, leave=False) as epoch_bar:
                     for _ in epoch_bar:
-                        _, t = train_epoch(
+                        times = train(
                             model=model,
                             optimizer=optimizer,
                             train_loader=train_loader,
@@ -190,17 +231,19 @@ class Trainer:
                         acc = test(
                             model=model, test_loader=test_loader, device=self.device
                         )
-                        data["times"].append(t)
-                        data["accs"].append(acc)
-                self.toml_dict["hyper"].append(hyper)
-                self.toml_dict["data"].append(data)
-                self.save_data()
-
-    def save_data(self):
-        with open(self.output_path, "w", encoding="utf-8") as f:
-            f.write(tomlkit.dumps(self.toml_dict))
+                        for time in times:
+                            data = {}
+                            data["time"] = time
+                            data["acc"] = acc
+                            data.update(hyper)
+                            data.update(self.hardware)
+                            datas.append(data)
+                        self._save_data(data=datas)
 
 
 if __name__ == "__main__":
-    trainer = Trainer(20, "./data/results.toml")
+    parse = argparse.ArgumentParser()
+    parse.add_argument("experiment", type=int, help="輸入試驗次數")
+    args = parse.parse_args()
+    trainer = Trainer("./data", args.experiment, "./output")
     trainer.run()
